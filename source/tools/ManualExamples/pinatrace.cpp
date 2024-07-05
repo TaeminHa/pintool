@@ -26,6 +26,8 @@
 #include <errno.h>
 #include <cstdio>
 #include <sys/syscall.h> 
+#include <unordered_map>
+#include <mutex>
 //#include "numa.h"
 //#include "numaif.h"
 //#include "numaint.h"
@@ -213,8 +215,36 @@ long get_mempolicy(int *policy, unsigned long *nmask,unsigned long maxnode, void
 					maxnode, addr, flags);
 }
 
+#define BUFFER_SIZE 1024 * 1024 * 256 
 
-FILE* trace;
+class Thread
+{
+public:
+    int tid;
+    int node_id;
+    std::string buffer;
+    FILE* trace;
+
+    Thread(int t) : tid(t) {
+        buffer.reserve(BUFFER_SIZE);
+        trace = fopen(("/mydata/results/pinatrace/" + std::to_string(tid) + ".out").c_str(), "w");
+        if (trace == nullptr) {
+            // Handle file open error
+            perror("Failed to open file");
+        }
+    }
+
+    ~Thread() {
+        if (trace != nullptr) {
+            fwrite(buffer.c_str(), sizeof(char), buffer.size(), trace);
+            fflush(trace);        
+            fclose(trace);
+        }
+    }
+};
+
+std::unordered_map<THREADID, Thread*> thread_map;
+std::mutex thread_map_mutex;
 
 // Print a memory read record
 VOID RecordMemRead(VOID* ip, VOID* addr) {
@@ -227,10 +257,20 @@ VOID RecordMemRead(VOID* ip, VOID* addr) {
     move_pages(0, 1, &addr, NULL, status, 0); 
 	
     syscall(SYS_getcpu, &cpu_id, &node_id);
-    if (static_cast<unsigned int>(status[0]) == node_id)
-        fprintf(trace, "RL (%d %d) %p\n", node_id, status[0], addr);
-    else
-        fprintf(trace, "RR (%d %d) %p\n", node_id, status[0], addr);
+
+    THREADID tid = PIN_ThreadId();
+    std::lock_guard<std::mutex> lock(thread_map_mutex);
+    Thread* thread = thread_map[tid];
+    if (thread) {
+        if (static_cast<unsigned int>(status[0]) == node_id)
+            thread->buffer += "RL (" + std::to_string(node_id) + " " + std::to_string(status[0]) + ") " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + ",";
+        else
+            thread->buffer += "RR (" + std::to_string(node_id) + " " + std::to_string(status[0]) + ") " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + ",";
+        if (thread->buffer.size() > BUFFER_SIZE) {
+            fwrite(thread->buffer.c_str(), sizeof(char), thread->buffer.size(), thread->trace);
+            thread->buffer.clear();
+        }
+    }
 }
 
 // Print a memory write record
@@ -244,10 +284,21 @@ VOID RecordMemWrite(VOID* ip, VOID* addr) {
     move_pages(0, 1, &addr, NULL, status, 0); 
 	
     syscall(SYS_getcpu, &cpu_id, &node_id);
-    if (static_cast<unsigned int>(status[0]) == node_id)
-        fprintf(trace, "WL (%d %d) %p\n", node_id, status[0], addr);
-    else
-        fprintf(trace, "WR (%d %d) %p\n", node_id, status[0], addr);
+
+    THREADID tid = PIN_ThreadId();
+    std::lock_guard<std::mutex> lock(thread_map_mutex);
+    Thread* thread = thread_map[tid];
+    if (thread) {
+        if (static_cast<unsigned int>(status[0]) == node_id)
+            thread->buffer += "WL (" + std::to_string(node_id) + " " + std::to_string(status[0]) + ") " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + ",";
+        else
+            thread->buffer += "WR (" + std::to_string(node_id) + " " + std::to_string(status[0]) + ") " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + ",";
+        
+        if (thread->buffer.size() > BUFFER_SIZE) {
+            fwrite(thread->buffer.c_str(), sizeof(char), thread->buffer.size(), thread->trace);
+            thread->buffer.clear();
+        }
+    }
 }
 
 // Is called for every instruction and instruments reads and writes
@@ -279,10 +330,29 @@ VOID Instruction(INS ins, VOID* v)
     }
 }
 
+VOID ThreadStart(THREADID threadid, CONTEXT* ctxt, INT32 flags, VOID* v)
+{
+    std::lock_guard<std::mutex> lock(thread_map_mutex);
+    thread_map[threadid] = new Thread(threadid);
+}
+ 
+// This routine is executed every time a thread is destroyed.
+VOID ThreadFini(THREADID threadid, const CONTEXT* ctxt, INT32 code, VOID* v)
+{
+    std::lock_guard<std::mutex> lock(thread_map_mutex);
+    Thread* thread = thread_map[threadid];
+    fwrite(thread->buffer.c_str(), sizeof(char), thread->buffer.size(), thread->trace);
+    delete thread;
+    thread_map.erase(threadid);
+}
+
 VOID Fini(INT32 code, VOID* v)
 {
-    fprintf(trace, "#eof\n");
-    fclose(trace);
+    for (auto& entry : thread_map) {
+        fwrite(entry.second->buffer.c_str(), sizeof(char), entry.second->buffer.size(), entry.second->trace);
+        delete entry.second;
+    }
+    thread_map.clear();
 }
 
 /* ===================================================================== */
@@ -303,9 +373,11 @@ int main(int argc, char* argv[])
 {
     if (PIN_Init(argc, argv)) return Usage();
 
-    trace = fopen("pinatrace.out", "w");
-
     INS_AddInstrumentFunction(Instruction, 0);
+    
+    PIN_AddThreadStartFunction(ThreadStart, 0);
+    PIN_AddThreadFiniFunction(ThreadFini, 0);
+
     PIN_AddFiniFunction(Fini, 0);
 
     // Never returns
